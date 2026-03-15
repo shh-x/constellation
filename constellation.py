@@ -1,15 +1,14 @@
 ﻿"""
 ╔══════════════════════════════════════════════════════╗
-║        COSMIC SIMULATION ENGINE  — v5.0              ║
+║        COSMIC SIMULATION ENGINE  — v6.0              ║
 ║                                                      ║
-║  GESTURE ZONES (based on wrist distance only):       ║
+║  GESTURE ZONES (RAW PIXEL distance between wrists):  ║
 ║  ─────────────────────────────────────────────────   ║
-║  dist < 0.16  → BLACK HOLE   (hands together)        ║
-║  dist > 0.55  → SUPERNOVA    (hands apart, once)     ║
-║  hands above nose → GALAXY SWIRL                     ║
-║  otherwise    → STELLAR DRIFT                        ║
+║  dist < 250px  → BLACK HOLE   (hands together)       ║
+║  dist > 550px  → SUPERNOVA    (hands apart, once)    ║
+║  otherwise     → STELLAR DRIFT                       ║
 ║                                                      ║
-║  BLACK HOLE:  particles drain into hands forever     ║
+║  BLACK HOLE:  particles drain into hands             ║
 ║               stays until SPACE is pressed           ║
 ║  SUPERNOVA:   fires once, 2.5s cooldown              ║
 ╚══════════════════════════════════════════════════════╝
@@ -21,7 +20,6 @@ Controls:
 """
 
 import sys, os, math, time
-# Windows: prevent Unicode crash in terminal
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 from collections import deque
@@ -46,12 +44,23 @@ BG_IMAGE_PATH = os.path.join(_HERE, "background.png")
 MODE_NORMAL    = "STELLAR DRIFT"
 MODE_BLACKHOLE = "BLACK HOLE"
 MODE_SUPERNOVA = "SUPERNOVA"
-MODE_GALAXY    = "GALAXY SWIRL"
 
-# Gesture distance thresholds (fraction of shoulder span)
-DIST_BH_THRESH = 0.38   # closer than this  → black hole
-DIST_SN_THRESH = 0.55   # farther than this → supernova trigger
-BH_HOLD_FRAMES = 1      # 1 = triggers on the VERY FIRST frame hands are close
+# ===================================================
+#  GESTURE THRESHOLDS — RAW PIXEL DISTANCE
+#
+#  No shoulder-span normalisation. Just pixels.
+#
+#  At 1-2m from webcam on 1280x720:
+#    hands touching  →  ~50-150 px apart
+#    hands relaxed   →  ~250-450 px apart
+#    hands wide open →  ~550-900 px apart
+#
+#  BH_PIXEL_THRESH = 250   ← generous, easy to trigger
+#  SN_PIXEL_THRESH = 550   ← spread arms wide
+# ===================================================
+BH_PIXEL_THRESH = 250    # wrists closer than this  → BLACK HOLE
+SN_PIXEL_THRESH = 550    # wrists farther than this → SUPERNOVA
+BH_HOLD_FRAMES  = 1      # instant trigger, no holding needed
 
 def clamp(v, lo, hi):  return max(lo, min(hi, v))
 def lerp(a, b, t):     return a + (b - a) * t
@@ -114,13 +123,6 @@ class SoundManager:
               (np.sin(2*np.pi*60*t)+np.sin(2*np.pi*90*t))*np.exp(-t*5)*0.5)
         self._sounds['supernova'] = self._make(self._env(sn, 0.001, 0.15) * 0.85)
 
-        # Galaxy: ethereal shimmer
-        t     = self._t(1.2)
-        freq2 = 200 + t*300
-        gal   = np.sin(2*np.pi*np.cumsum(freq2)/self.SR)
-        gal  += np.sin(2*np.pi*660*t)*0.3*np.sin(2*np.pi*3*t)
-        self._sounds['galaxy'] = self._make(self._env(gal, 0.05, 0.5) * 0.5)
-
         # Scan ping
         t    = self._t(0.35)
         scan = np.sin(2*np.pi*1200*t)*np.exp(-t*6) + np.sin(2*np.pi*1800*t)*np.exp(-t*10)*0.4
@@ -141,41 +143,44 @@ class SoundManager:
 
 
 # ===================================================
-#  GESTURE RECOGNISER  v5
+#  GESTURE RECOGNISER  v6  —  RAW PIXEL DISTANCE
 #
-#  Pure distance-zone logic — no velocity, no latch:
+#  Key insight: MediaPipe landmarks are in 0..1 range.
+#  Multiply by WIDTH/HEIGHT to get pixel coords.
+#  Then measure pixel distance directly — no body_ref,
+#  no normalisation, no shoulder span.
 #
-#  Zone A  dist_norm < DIST_BH_THRESH  →  Black Hole
-#  Zone B  dist_norm > DIST_SN_THRESH  →  Supernova (once per cooldown)
-#  Zone C  hands above nose            →  Galaxy Swirl
-#  Zone D  everything else             →  Normal
-#
-#  Black hole activates after BH_HOLD_FRAMES consecutive
-#  frames in Zone A, deactivates immediately on exit.
-#
-#  Supernova fires ONCE when entering Zone B.
-#  After firing, a 2.5s cooldown prevents re-fire
-#  even if hands stay apart.
+#  Zone A:  pixel_dist < BH_PIXEL_THRESH  → Black Hole
+#  Zone B:  pixel_dist > SN_PIXEL_THRESH  → Supernova
+#  Zone C:  everything else               → Normal
 # ===================================================
 class GestureRecogniser:
     SUPERNOVA_COOLDOWN = 2.5
 
     def __init__(self, w, h):
-        self.w, self.h     = w, h
-        self._slw          = None      # smoothed left  wrist
-        self._srw          = None      # smoothed right wrist
-        self._K            = 0.70      # smoothing factor (high = fast response)
-        self._bh_frames    = 0         # consecutive Zone-A frames
-        self._sn_cooldown  = 0.0       # supernova cooldown timer
-        self._was_in_zone_b = False    # True while hands are apart
+        self.w, self.h      = w, h
+        # Smoothed wrist pixel positions
+        self._slw           = None   # left  wrist [px_x, px_y]
+        self._srw           = None   # right wrist [px_x, px_y]
+        self._K             = 0.60   # smoothing (lower = smoother but slower)
+        self._bh_frames     = 0
+        self._sn_cooldown   = 0.0
+        self._was_in_zone_b = False
+        self._dbg           = 0
 
-    def _get(self, lm, idx, min_vis=0.15):
+    def _wrist_px(self, lm, idx):
+        """
+        Return wrist position in pixels, or None if landmark not visible.
+        Accepts very low visibility (0.05) because wrists are often
+        occluded when hands are together — exactly when we need them most.
+        """
         l   = lm[idx]
         vis = getattr(l, 'visibility', 1.0)
         pre = getattr(l, 'presence',   1.0)
-        if vis < min_vis or pre < min_vis:
+        if vis < 0.05 or pre < 0.05:
             return None
-        return np.array([l.x * self.w, l.y * self.h])
+        # Convert normalised (0..1) → pixel coords
+        return np.array([l.x * self.w, l.y * self.h], dtype=np.float64)
 
     def update(self, landmarks, dt):
         """
@@ -189,99 +194,83 @@ class GestureRecogniser:
             self._was_in_zone_b = False
             return MODE_NORMAL, None, False
 
-        lm  = landmarks
-        lw  = self._get(lm, 15)          # left  wrist
-        rw  = self._get(lm, 16)          # right wrist
-        nse = self._get(lm,  0, min_vis=0.15)
-        ls  = self._get(lm, 11)          # left  shoulder
-        rs  = self._get(lm, 12)          # right shoulder
+        lm = landmarks
 
-        # When hands overlap MediaPipe often loses wrists — use last smooth pos
-        if lw is None:
-            lw = self._slw  # fallback to last known
-        if rw is None:
-            rw = self._srw
+        # --- Get raw pixel positions (very permissive visibility) -------
+        lw_raw = self._wrist_px(lm, 15)   # left  wrist
+        rw_raw = self._wrist_px(lm, 16)   # right wrist
+
+        # Fallback to last smoothed position when MediaPipe loses a wrist
+        # (this happens most when hands are close together — worst time to fail)
+        lw = lw_raw if lw_raw is not None else self._slw
+        rw = rw_raw if rw_raw is not None else self._srw
+
         if lw is None or rw is None:
+            # No position data at all — stay normal
             self._bh_frames = 0
             return MODE_NORMAL, None, False
 
-        # -- Smooth wrist positions
+        # --- Smooth wrist positions (exponential moving average) --------
         K = self._K
         if self._slw is None:
-            self._slw, self._srw = lw.copy(), rw.copy()
+            self._slw = lw.copy()
+            self._srw = rw.copy()
         else:
-            self._slw = self._slw*(1-K) + lw*K
-            self._srw = self._srw*(1-K) + rw*K
-        slw, srw = self._slw, self._srw
+            self._slw = self._slw * (1 - K) + lw * K
+            self._srw = self._srw * (1 - K) + rw * K
 
-        # -- Body-scale reference
-        if ls is not None and rs is not None:
-            body_ref = max(np.linalg.norm(ls - rs), 1.0)
-        else:
-            body_ref = self.w * 0.25
+        # --- Compute pixel distances ------------------------------------
+        # raw:    using the raw (unsmoothed) positions — reacts instantly
+        # smooth: using smoothed positions — more stable
+        # Use the MINIMUM so that any instant close moment triggers BH
+        dist_raw    = float(np.linalg.norm(lw - rw))
+        dist_smooth = float(np.linalg.norm(self._slw - self._srw))
+        dist_px     = min(dist_raw, dist_smooth)
 
-        dist_smooth = np.linalg.norm(slw - srw) / body_ref
-        dist_raw    = np.linalg.norm(lw - rw) / body_ref
-        # Use whichever is smaller — so the INSTANT raw hands are close, it triggers
-        dist_norm   = min(dist_smooth, dist_raw)
+        # --- Debug log every 15 frames ----------------------------------
+        self._dbg += 1
+        if self._dbg % 15 == 0:
+            if dist_px < BH_PIXEL_THRESH:
+                zone = f">>> BLACK HOLE <<< ({dist_px:.0f}px < {BH_PIXEL_THRESH})"
+            elif dist_px > SN_PIXEL_THRESH:
+                zone = f"SUPERNOVA ({dist_px:.0f}px > {SN_PIXEL_THRESH})"
+            else:
+                zone = f"normal ({dist_px:.0f}px)"
+            print(f"  [GESTURE] raw={dist_raw:.0f}px  smooth={dist_smooth:.0f}px  "
+                  f"used={dist_px:.0f}px  [{zone}]")
 
-        # Debug: print distance so user can see how close they are
-        self._dbg_counter = getattr(self, '_dbg_counter', 0) + 1
-        if self._dbg_counter % 15 == 0:
-            zone = "BH" if dist_norm < DIST_BH_THRESH else ("SN" if dist_norm > DIST_SN_THRESH else "--")
-            print(f"  [GESTURE] raw={dist_raw:.2f} smooth={dist_smooth:.2f} -> {dist_norm:.2f}  BH<{DIST_BH_THRESH}  zone={zone}")
-
-        # ====================================
-        #  ZONE A — HANDS TOGETHER → Black Hole
-        # ====================================
-        if dist_norm < DIST_BH_THRESH:
+        # ── ZONE A: BLACK HOLE ──────────────────────────────────────────
+        if dist_px < BH_PIXEL_THRESH:
             self._bh_frames    += 1
             self._was_in_zone_b = False
             if self._bh_frames >= BH_HOLD_FRAMES:
-                # Use midpoint of RAW wrists for accuracy
-                bh_pos = (lw + rw) / 2
+                # BH center = midpoint of raw wrists (more accurate than smoothed)
+                bh_pos = (lw + rw) / 2.0
                 return MODE_BLACKHOLE, bh_pos, False
             return MODE_NORMAL, None, False
 
-        # Hands not together — decay bh counter
-        self._bh_frames = max(0, self._bh_frames - 1)
+        # Hands not in Zone A — reset BH counter
+        self._bh_frames = 0
 
-        # ====================================
-        #  ZONE B — HANDS APART → Supernova
-        # ====================================
-        if dist_norm > DIST_SN_THRESH:
+        # ── ZONE B: SUPERNOVA ───────────────────────────────────────────
+        if dist_px > SN_PIXEL_THRESH:
             supernova_fired = False
-            # Fire once on ENTRY into Zone B (was_in_zone_b was False)
             if not self._was_in_zone_b and self._sn_cooldown <= 0:
-                supernova_fired     = True
-                self._sn_cooldown   = self.SUPERNOVA_COOLDOWN
+                supernova_fired   = True
+                self._sn_cooldown = self.SUPERNOVA_COOLDOWN
             self._was_in_zone_b = True
-            return MODE_SUPERNOVA if supernova_fired else MODE_NORMAL, None, supernova_fired
+            # Mode is SUPERNOVA only on the frame it fires, then returns NORMAL
+            return (MODE_SUPERNOVA if supernova_fired else MODE_NORMAL), None, supernova_fired
 
-        # Between zones — reset zone-B latch so next separation fires again
+        # Between zones — reset zone-B latch
         self._was_in_zone_b = False
 
-        # ====================================
-        #  ZONE C — HANDS UP → Galaxy Swirl
-        # ====================================
-        if nse is not None:
-            above = slw[1] < nse[1] - 30 and srw[1] < nse[1] - 30
-        elif ls is not None and rs is not None:
-            above = slw[1] < (ls[1]+rs[1])/2 and srw[1] < (ls[1]+rs[1])/2
-        else:
-            above = False
-
-        if above:
-            return MODE_GALAXY, None, False
-
-        # ====================================
-        #  ZONE D — Normal
-        # ====================================
+        # ── ZONE C: NORMAL ──────────────────────────────────────────────
         return MODE_NORMAL, None, False
 
 
 # ===================================================
-#  PARTICLE SPAWNER — on skeleton
+#  PARTICLE SPAWNER
 # ===================================================
 def spawn_on_skeleton(num_p, targets):
     if targets is None or len(targets) == 0:
@@ -312,20 +301,19 @@ class AccretionDisk:
         cx, cy = int(self.center[0]), int(self.center[1])
         s = pygame.Surface((surf.get_width(), surf.get_height()), pygame.SRCALPHA)
         a = self.alpha
-        # Glowing rings
         for r, th, col in [
-            (140,24,(255, 90, 10)),
-            (108,16,(255,170, 30)),
-            ( 76,11,(255,240,110)),
-            ( 48, 7,(255,255,210)),
+            (140, 24, (255,  90,  10)),
+            (108, 16, (255, 170,  30)),
+            ( 76, 11, (255, 240, 110)),
+            ( 48,  7, (255, 255, 210)),
         ]:
-            pygame.draw.ellipse(s, (*col, int(clamp(190*a,0,255))),
+            pygame.draw.ellipse(s, (*col, int(clamp(190*a, 0, 255))),
                                 (cx-r, cy-r//3, r*2, r*2//3), th)
-        pygame.draw.circle(s, (0,0,0,       int(255*a)), (cx,cy), 32)
-        pygame.draw.circle(s, (200,200,255, int(140*a)), (cx,cy), 40, 2)
-        for gr, ga in [(22,80),(16,120),(10,180)]:
-            pygame.draw.circle(s, (255,140,0,int(ga*a)), (cx,cy), gr)
-        surf.blit(s, (0,0))
+        pygame.draw.circle(s, (  0,   0,   0, int(255*a)), (cx, cy), 32)
+        pygame.draw.circle(s, (200, 200, 255, int(140*a)), (cx, cy), 40, 2)
+        for gr, ga in [(22, 80), (16, 120), (10, 180)]:
+            pygame.draw.circle(s, (255, 140, 0, int(ga*a)), (cx, cy), gr)
+        surf.blit(s, (0, 0))
 
 
 # ===================================================
@@ -351,70 +339,23 @@ class ShockwaveManager:
         if not self.waves: return
         s = pygame.Surface((surf.get_width(), surf.get_height()), pygame.SRCALPHA)
         for w in self.waves:
-            a  = int(clamp(w['alpha'],0,255))
+            a  = int(clamp(w['alpha'], 0, 255))
             r  = int(w['r'])
             if r <= 0: continue
-            th = max(1, int(5*(1-w['r']/w['maxr']))+1)
-            pygame.draw.circle(s, (*w['col'],a), (int(w['cx']),int(w['cy'])), r, th)
-        surf.blit(s, (0,0))
+            th = max(1, int(5*(1 - w['r']/w['maxr'])) + 1)
+            pygame.draw.circle(s, (*w['col'], a), (int(w['cx']), int(w['cy'])), r, th)
+        surf.blit(s, (0, 0))
 
 
 # ===================================================
-#  GALAXY OVERLAY
-# ===================================================
-class GalaxyOverlay:
-    def __init__(self, w, h):
-        self.w, self.h = w, h
-        self.alpha     = 0.0
-        self.angle     = 0.0
-        self._arms     = self._gen()
-
-    def _gen(self):
-        arms = []
-        for arm in range(3):
-            base = arm*(2*math.pi/3)
-            pts  = []
-            for i in range(60):
-                r   = 30 + i*4.5
-                ang = base + i*0.18
-                pts.append((WIDTH//2+r*math.cos(ang), HEIGHT//2+r*math.sin(ang)*0.5, r))
-            arms.append(pts)
-        return arms
-
-    def update(self, active, dt):
-        self.angle += dt*40
-        tgt = 1.0 if active else 0.0
-        self.alpha = clamp(self.alpha+(tgt-self.alpha)*dt*30, 0, 1)
-
-    def draw(self, surf):
-        if self.alpha <= 0.01: return
-        s  = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
-        t  = time.time()
-        ar = math.radians(self.angle)
-        cx, cy = self.w//2, self.h//2
-        for arm_pts in self._arms:
-            for i,(x,y,r) in enumerate(arm_pts):
-                frac = i/len(arm_pts)
-                dx,dy = x-cx, y-cy
-                nx = cx+dx*math.cos(ar)-dy*math.sin(ar)
-                ny = cy+dx*math.sin(ar)+dy*math.cos(ar)
-                a   = int(clamp(130*self.alpha*(1-frac*0.6),0,255))
-                pulse = abs(math.sin(t*3+frac*8))
-                col = lerp_col((80,40,200),(180,120,255),pulse)
-                pygame.draw.circle(s,(*col,a),(int(nx),int(ny)),max(1,int(2*(1-frac*0.5))))
-        surf.blit(s,(0,0))
-
-
-# ===================================================
-#  HUD
+#  HUD  (2 gestures only)
 # ===================================================
 class HUD:
-    COL_CYAN   = (100, 220, 255)
-    COL_PURPLE = (160,  90, 255)
-    COL_WHITE  = (230, 235, 255)
-    COL_GOLD   = (255, 200,  60)
-    COL_RED    = (255,  80,  70)
-    COL_PANEL  = (10,   18,  40, 165)
+    COL_CYAN  = (100, 220, 255)
+    COL_WHITE = (230, 235, 255)
+    COL_GOLD  = (255, 200,  60)
+    COL_RED   = (255,  80,  70)
+    COL_PANEL = ( 10,  18,  40, 165)
 
     def __init__(self, w, h):
         self.w, self.h      = w, h
@@ -429,6 +370,8 @@ class HUD:
         self.person         = False
         self.scan_pct       = 0.0
         self.scanning       = False
+        # Live distance display
+        self.wrist_px       = 0.0
 
         pygame.font.init()
         self._f_flash = pygame.font.SysFont("Courier New", 52, bold=True)
@@ -436,7 +379,7 @@ class HUD:
         self._f_small = pygame.font.SysFont("Courier New", 13)
         self._f_tiny  = pygame.font.SysFont("Courier New", 11)
 
-    def update(self, dt, mode, fps, particles, person, scanning, scan_y):
+    def update(self, dt, mode, fps, particles, person, scanning, scan_y, wrist_px=0):
         self._t             += dt
         self.mode            = mode
         self.fps             = fps
@@ -444,6 +387,7 @@ class HUD:
         self.person          = person
         self.scanning        = scanning
         self.scan_pct        = scan_y / HEIGHT
+        self.wrist_px        = wrist_px
         if self.flash_timer    > 0: self.flash_timer    -= dt
         if self.screenshot_msg > 0: self.screenshot_msg -= dt
 
@@ -456,7 +400,6 @@ class HUD:
         return {
             MODE_BLACKHOLE: self.COL_GOLD,
             MODE_SUPERNOVA: self.COL_RED,
-            MODE_GALAXY:    self.COL_PURPLE,
         }.get(self.mode, self.COL_CYAN)
 
     def _panel(self, surf, x, y, w, h):
@@ -473,17 +416,17 @@ class HUD:
 
         # Corner brackets
         CL = 32
-        for (cx2,cy2),(dx,dy) in [
-            ((8,8),(1,1)),((self.w-8,8),(-1,1)),
-            ((8,self.h-8),(1,-1)),((self.w-8,self.h-8),(-1,-1))
+        for (cx2, cy2), (dx, dy) in [
+            ((8, 8),(1, 1)), ((self.w-8, 8),(-1, 1)),
+            ((8, self.h-8),(1,-1)), ((self.w-8, self.h-8),(-1,-1))
         ]:
             ca = int(210*pulse)
-            pygame.draw.line(ov,(*mc,ca),(cx2,cy2),(cx2+dx*CL,cy2),2)
-            pygame.draw.line(ov,(*mc,ca),(cx2,cy2),(cx2,cy2+dy*CL),2)
-            pygame.draw.circle(ov,(*mc,ca),(cx2,cy2),2)
+            pygame.draw.line(ov, (*mc,ca), (cx2,cy2), (cx2+dx*CL, cy2), 2)
+            pygame.draw.line(ov, (*mc,ca), (cx2,cy2), (cx2, cy2+dy*CL), 2)
+            pygame.draw.circle(ov, (*mc,ca), (cx2,cy2), 2)
 
         # Top-left status panel
-        self._panel(ov, 8, 8, 280, 58)
+        self._panel(ov, 8, 8, 300, 72)
         dot_col = (60,220,80) if self.person else (180,60,60)
         pygame.draw.circle(ov, (*dot_col,220), (22,22), 5)
         ring_r = int(8+3*abs(math.sin(self._t*4)))
@@ -496,8 +439,30 @@ class HUD:
             f"FPS {int(self.fps):>3}   STARS {self.particles:>4}",
             True, (*self.COL_WHITE,130)), (14,38))
 
+        # Live wrist distance bar  ← KEY DEBUG INFO
+        if self.person and self.wrist_px > 0:
+            bar_w  = 270
+            filled = int(bar_w * min(1.0, self.wrist_px / SN_PIXEL_THRESH))
+            bh_x   = int(bar_w * BH_PIXEL_THRESH / SN_PIXEL_THRESH)
+            # background
+            pygame.draw.rect(ov, (30,30,60,180), (14, 54, bar_w, 10))
+            # filled portion — colour by zone
+            if self.wrist_px < BH_PIXEL_THRESH:
+                bar_col = (255,200,60)   # gold = BH zone
+            elif self.wrist_px > SN_PIXEL_THRESH:
+                bar_col = (255,80,70)    # red  = SN zone
+            else:
+                bar_col = (100,220,255)  # cyan = normal
+            pygame.draw.rect(ov, (*bar_col,200), (14, 54, filled, 10))
+            # BH threshold marker
+            pygame.draw.line(ov, (255,200,60,220), (14+bh_x,52), (14+bh_x,64), 2)
+            label = self._f_tiny.render(
+                f"wrist {int(self.wrist_px)}px  BH<{BH_PIXEL_THRESH}  SN>{SN_PIXEL_THRESH}",
+                True, (*bar_col,190))
+            ov.blit(label, (14, 66))
+
         # Top-right mode badge
-        badge = self._f_med.render(self.mode, True, (*mc,int(235*pulse)))
+        badge = self._f_med.render(self.mode, True, (*mc, int(235*pulse)))
         bw    = badge.get_width()
         bx    = self.w - bw - 16
         self._panel(ov, bx-8, 6, bw+16, 44)
@@ -506,28 +471,24 @@ class HUD:
         pygame.draw.rect(ov, (*mc,50),  (bx,38,bw,2))
         pygame.draw.rect(ov, (*mc,220), (bx,38,bar_fill,2))
 
-        # Gesture guide (bottom-left)
+        # Gesture guide (bottom-left) — 2 gestures only
         gestures = [
             ("Hands Together", "Black Hole"),
-            ("Hands Up",       "Galaxy Swirl"),
             ("Hands Apart",    "Supernova"),
         ]
         gh = 14*len(gestures)+16
         gy = self.h - gh - 28
         self._panel(ov, 8, gy, 240, gh)
-        for i,(trigger,effect) in enumerate(gestures):
+        for i, (trigger, effect) in enumerate(gestures):
             active_g = effect.upper().replace(" ","") in self.mode.upper().replace(" ","")
             col_e    = (*mc,210) if active_g else (120,140,170,170)
             ov.blit(self._f_tiny.render(f"{trigger}  ->  {effect}", True, col_e),
                     (16, gy+8+i*14))
 
         # Bottom controls
-        ov.blit(self._f_tiny.render(
-            "SPACE Rescan  |  M Debug  |  S Screenshot  |  ESC Quit",
-            True,(70,85,110,135)),
-            (self.w//2 - self._f_tiny.size(
-                "SPACE Rescan  |  M Debug  |  S Screenshot  |  ESC Quit")[0]//2,
-             self.h-16))
+        ctrl = "SPACE Rescan  |  M Debug  |  S Screenshot  |  ESC Quit"
+        ov.blit(self._f_tiny.render(ctrl, True, (70,85,110,135)),
+                (self.w//2 - self._f_tiny.size(ctrl)[0]//2, self.h-16))
 
         # Scan bar
         if self.scanning:
@@ -536,45 +497,39 @@ class HUD:
             pygame.draw.rect(ov, (*mc,35),  (20,self.h-46,bw2,3))
             pygame.draw.rect(ov, (*mc,200), (20,self.h-46,fill2,3))
             if fill2 > 0:
-                pygame.draw.circle(ov,(*mc,180),(20+fill2,self.h-44),4)
-            ov.blit(self._f_small.render(
-                "ASTRAL ENTITY SCAN IN PROGRESS", True,(60,220,80,180)),
-                (self.w//2-self._f_small.size(
-                    "ASTRAL ENTITY SCAN IN PROGRESS")[0]//2, self.h-62))
+                pygame.draw.circle(ov, (*mc,180), (20+fill2,self.h-44), 4)
+            lbl = "ASTRAL ENTITY SCAN IN PROGRESS"
+            ov.blit(self._f_small.render(lbl, True, (60,220,80,180)),
+                    (self.w//2-self._f_small.size(lbl)[0]//2, self.h-62))
 
         # Centre flash pop
         if self.flash_timer > 0:
             alpha = int(255 * min(1.0, self.flash_timer / 0.5))
             fc    = self.flash_col
-
             for off in [(3,3),(-3,3),(3,-3),(-3,-3)]:
                 g = self._f_flash.render(self.flash_msg, True,
                                          (*fc, clamp(alpha//5, 0, 255)))
                 ov.blit(g, (self.w//2 - g.get_width()//2 + off[0],
                             self.h//2 - g.get_height()//2 - 60 + off[1]))
-
             fs = self._f_flash.render(self.flash_msg, True,
                                       (*fc, clamp(alpha, 0, 255)))
             ov.blit(fs, (self.w//2 - fs.get_width()//2,
                          self.h//2 - fs.get_height()//2 - 60))
-
             tw = fs.get_width()
             tx = self.w//2 - tw//2
             ty = self.h//2 - 60 + fs.get_height() + 4
             line_fill = int(tw * min(1.0, (2.2 - self.flash_timer) / 0.4))
-            pygame.draw.rect(ov, (*fc, clamp(alpha//2, 0, 255)),
-                             (tx, ty, tw, 2))
-            pygame.draw.rect(ov, (*fc, clamp(alpha, 0, 255)),
-                             (tx, ty, line_fill, 2))
+            pygame.draw.rect(ov, (*fc, clamp(alpha//2, 0, 255)), (tx, ty, tw, 2))
+            pygame.draw.rect(ov, (*fc, clamp(alpha,    0, 255)), (tx, ty, line_fill, 2))
 
         # Screenshot toast
         if self.screenshot_msg > 0:
-            a = int(clamp(self.screenshot_msg*130,0,255))
-            self._panel(ov,self.w//2-130,60,260,36)
-            ss = self._f_med.render("* SCREENSHOT SAVED *",True,(*self.COL_GOLD,a))
-            ov.blit(ss,(self.w//2-ss.get_width()//2,68))
+            a = int(clamp(self.screenshot_msg*130, 0, 255))
+            self._panel(ov, self.w//2-130, 60, 260, 36)
+            ss = self._f_med.render("* SCREENSHOT SAVED *", True, (*self.COL_GOLD,a))
+            ov.blit(ss, (self.w//2-ss.get_width()//2, 68))
 
-        surf.blit(ov,(0,0))
+        surf.blit(ov, (0, 0))
 
 
 # ===================================================
@@ -583,33 +538,38 @@ class HUD:
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("COSMIC SIMULATION ENGINE")
+    pygame.display.set_caption("COSMIC SIMULATION ENGINE  v6.0")
     clock  = pygame.time.Clock()
 
-    print("=" * 54)
-    print("  COSMIC SIMULATION ENGINE  v5.0")
-    print("=" * 54)
+    print("=" * 60)
+    print("  COSMIC SIMULATION ENGINE  v6.0")
+    print("  Pixel-based gesture detection — no normalisation")
+    print(f"  BLACK HOLE  : bring wrists within {BH_PIXEL_THRESH}px of each other")
+    print(f"  SUPERNOVA   : spread wrists beyond {SN_PIXEL_THRESH}px apart")
+    print("=" * 60)
 
-    # Background
-    print("  [1/6] Loading background ...")
+    # --- Background -------------------------------------------------------
+    print("  [1/5] Loading background ...")
     try:
         bg = pygame.transform.scale(
             pygame.image.load(BG_IMAGE_PATH).convert(), (WIDTH, HEIGHT))
-        print(f"        OK")
+        print("        OK")
     except Exception as e:
-        print(f"        WARNING: {e} - solid fallback")
-        bg = pygame.Surface((WIDTH, HEIGHT)); bg.fill((2, 6, 22))
+        print(f"        WARNING: {e}  — using solid fallback")
+        bg = pygame.Surface((WIDTH, HEIGHT))
+        bg.fill((2, 6, 22))
 
-    # Webcam
-    print("  [2/6] Opening webcam ...")
+    # --- Webcam -----------------------------------------------------------
+    print("  [2/5] Opening webcam ...")
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
     if not cap.isOpened():
-        print("  ERROR: webcam unavailable."); sys.exit(1)
+        print("  ERROR: webcam unavailable.")
+        sys.exit(1)
 
-    # MediaPipe
-    print("  [3/6] Loading pose model ...")
+    # --- MediaPipe --------------------------------------------------------
+    print("  [3/5] Loading pose model ...")
     model_path            = os.path.join(_HERE, "pose_landmarker.task")
     BaseOptions           = mp.tasks.BaseOptions
     PoseLandmarker        = mp.tasks.vision.PoseLandmarker
@@ -618,25 +578,23 @@ def main():
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=VisionRunningMode.VIDEO,
-        min_pose_detection_confidence=0.55,
-        min_pose_presence_confidence=0.55,
-        min_tracking_confidence=0.55,
+        min_pose_detection_confidence=0.50,
+        min_pose_presence_confidence=0.50,
+        min_tracking_confidence=0.50,
     )
     pose = PoseLandmarker.create_from_options(options)
 
-    # Subsystems
-    print("  [4/6] Creating subsystems ...")
+    # --- Subsystems -------------------------------------------------------
+    print("  [4/5] Creating subsystems ...")
     gesture    = GestureRecogniser(WIDTH, HEIGHT)
     accretion  = AccretionDisk()
     shockwaves = ShockwaveManager()
-    galaxy_ov  = GalaxyOverlay(WIDTH, HEIGHT)
     hud        = HUD(WIDTH, HEIGHT)
 
-    print("  [5/6] Building audio ...")
+    print("  [5/5] Building audio ...")
     sound = SoundManager()
 
-    # Particles
-    print("  [6/6] Initialising particles ...")
+    # --- Particles --------------------------------------------------------
     num_p  = MAX_PARTICLES
     pos    = np.random.rand(num_p, 2) * [WIDTH, HEIGHT]
     vel    = np.zeros((num_p, 2))
@@ -651,7 +609,7 @@ def main():
     ]
     NUM_INTERP = 8
 
-    # Simulation state
+    # --- Simulation state -------------------------------------------------
     mode             = MODE_NORMAL
     last_mode        = mode
     person           = False
@@ -666,23 +624,24 @@ def main():
     prev_t           = time.time()
     running          = True
     _respawn_pending = False
+    live_wrist_px    = 0.0
 
-    # Persistent trail surface
     trail_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 
-    # ── BLACK HOLE CONSTANTS ──────────────────────────────────────────────
-    # G value high enough that ALL particles spiral in within a few seconds.
-    # Drain radius: particles closer than this are consumed each frame.
-    BH_G           = 180000.0   # was 65000 — strong enough to overcome any orbit
-    BH_DAMPING     = 0.88       # was 0.92 — less damping = faster acceleration
-    BH_CORE_RADIUS = 28         # was 18   — wider drain mouth
-    BH_SWIRL       = 0.18       # tangential spin fraction (spiral effect)
-    BH_SPEED_CAP   = 900.0      # px/s cap to prevent teleportation
+    # --- Black hole physics constants ------------------------------------
+    BH_G           = 180000.0
+    BH_DAMPING     = 0.88
+    BH_CORE_RADIUS = 28
+    BH_SWIRL       = 0.18
+    BH_SPEED_CAP   = 900.0
 
-    print("=" * 54)
-    print("  READY - Step into the void.")
-    print("  SPACE to respawn particles after black hole.")
-    print("=" * 54)
+    print("=" * 60)
+    print("  READY — Step into the void.")
+    print(f"  Bring hands together (< {BH_PIXEL_THRESH}px) to trigger BLACK HOLE.")
+    print(f"  Spread hands wide   (> {SN_PIXEL_THRESH}px) to trigger SUPERNOVA.")
+    print("  Watch the wrist-distance bar at top-left for live feedback.")
+    print("  SPACE to respawn particles after black hole drains them.")
+    print("=" * 60)
 
     while running:
         now    = time.time()
@@ -691,7 +650,6 @@ def main():
         clock.tick(TARGET_FPS)
         fps = clock.get_fps()
 
-        # Auto-reduce particles if FPS drops
         if fps < 26 and num_p > 400:
             cut    = min(40, num_p-400)
             num_p -= cut
@@ -705,7 +663,6 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
-
                 elif event.key == pygame.K_SPACE:
                     scanning         = True
                     scan_y           = 0.0
@@ -713,10 +670,8 @@ def main():
                     vel[:]           = 0
                     _respawn_pending = True
                     sound.play('scan')
-
                 elif event.key == pygame.K_m:
                     debug_mode = not debug_mode
-
                 elif event.key == pygame.K_s:
                     fname = f"cosmic_{int(time.time())}.png"
                     pygame.image.save(screen, fname)
@@ -738,7 +693,6 @@ def main():
         targets       = np.array([])
 
         if results.pose_landmarks:
-            # First-ever detection → trigger scan
             if not person:
                 person           = True
                 scanning         = True
@@ -752,11 +706,19 @@ def main():
             lms = results.pose_landmarks[0]
             mode, bh_center, supernova_now = gesture.update(lms, dt)
 
-            # Particle colour from average wrist height
+            # Expose live wrist distance for HUD bar
+            lw_l = lms[15]; rw_l = lms[16]
             try:
-                lw16 = lms[15]; rw16 = lms[16]
-                if getattr(lw16,'visibility',0)>0.4 and getattr(rw16,'visibility',0)>0.4:
-                    n_y     = clamp((lw16.y+rw16.y)/2, 0, 1)
+                lw_px = np.array([lw_l.x*WIDTH, lw_l.y*HEIGHT])
+                rw_px = np.array([rw_l.x*WIDTH, rw_l.y*HEIGHT])
+                live_wrist_px = float(np.linalg.norm(lw_px - rw_px))
+            except Exception:
+                pass
+
+            # Particle colour tint from wrist height
+            try:
+                if getattr(lw_l,'visibility',0)>0.3 and getattr(rw_l,'visibility',0)>0.3:
+                    n_y     = clamp((lw_l.y + rw_l.y)/2, 0, 1)
                     tgt_col = [int(lerp(0,200,n_y)), int(lerp(200,80,n_y)), int(lerp(255,255,n_y))]
             except Exception:
                 pass
@@ -774,14 +736,15 @@ def main():
                 if si in valid and ei in valid:
                     p1, p2 = valid[si], valid[ei]
                     for step in range(1, NUM_INTERP):
-                        f = step/NUM_INTERP
-                        interp.append(p1*(1-f)+p2*f)
+                        f = step / NUM_INTERP
+                        interp.append(p1*(1-f) + p2*f)
             all_pts = base + interp
             targets = np.array(all_pts) if all_pts else np.array([])
 
         else:
             mode = MODE_NORMAL
             gesture.update(None, dt)
+            live_wrist_px = 0.0
 
         # ── Mode-change events ──────────────────────────────────────────
         if mode != last_mode:
@@ -791,20 +754,17 @@ def main():
             if mode == MODE_BLACKHOLE:
                 sound.play('blackhole', 0.7)
                 hud.flash("BLACK HOLE", (255, 200, 60), 2.0)
-
-            elif mode == MODE_GALAXY:
-                sound.play('galaxy', 0.55)
-                hud.flash("GALAXY SWIRL", (160, 90, 255), 1.8)
+                print("  *** BLACK HOLE ACTIVATED ***")
 
             elif mode == MODE_NORMAL and prev_mode == MODE_BLACKHOLE:
                 hud.flash("PRESS SPACE TO RESPAWN", (100, 220, 255), 3.0)
 
-        # ── Supernova trigger ───────────────────────────────────────────
         if supernova_now:
             sound.play('supernova', 0.9)
             shockwaves.trigger(WIDTH//2, HEIGHT//2)
             flash_white = 1.0
             hud.flash("SUPERNOVA!", (255, 80, 70), 2.5)
+            print("  *** SUPERNOVA FIRED ***")
 
         # ── Scan logic ──────────────────────────────────────────────────
         if scanning:
@@ -831,8 +791,7 @@ def main():
             bh_center if bh_center is not None else np.array([WIDTH/2.0, HEIGHT/2.0]),
             dt)
         shockwaves.update(dt)
-        galaxy_ov.update(mode == MODE_GALAXY, dt)
-        hud.update(dt, mode, fps, num_p, person, scanning, scan_y)
+        hud.update(dt, mode, fps, num_p, person, scanning, scan_y, live_wrist_px)
 
         # ── Physics ─────────────────────────────────────────────────────
         G       = 5000.0
@@ -841,45 +800,32 @@ def main():
         phys_targets = targets.copy() if len(targets) > 0 else np.array([])
 
         if supernova_now or mode == MODE_SUPERNOVA:
-            G             = -34000.0
-            DAMPING       = 0.98
-        elif mode == MODE_GALAXY:
-            G       = 7500.0
-            DAMPING = 0.96
+            G       = -34000.0
+            DAMPING = 0.98
 
-        # ── BLACK HOLE PHYSICS (completely rewritten) ───────────────────
+        # ── BLACK HOLE PHYSICS ──────────────────────────────────────────
         if mode == MODE_BLACKHOLE and bh_center is not None:
             if np.any(active):
                 ap  = pos[active]
                 av  = vel[active]
-
                 bh  = bh_center.astype(np.float64)
-                d   = bh - ap                                    # (K,2) to hole
-                dsq = d[:,0]**2 + d[:,1]**2 + 1.0               # (K,)
-                dn  = np.sqrt(dsq)                               # (K,) distance
-
-                # Radial pull (inverse-square)
-                fm   = BH_G / dsq                                # (K,)
-                norm = d / dn[:,np.newaxis]                      # (K,2) unit vec
-
-                # Tangential swirl (perpendicular, same magnitude fraction)
-                tang = np.stack([-d[:,1], d[:,0]], axis=1)       # (K,2) perp
+                d   = bh - ap
+                dsq = d[:,0]**2 + d[:,1]**2 + 1.0
+                dn  = np.sqrt(dsq)
+                fm   = BH_G / dsq
+                norm = d / dn[:,np.newaxis]
+                tang = np.stack([-d[:,1], d[:,0]], axis=1)
                 tn   = np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
                 tang = tang / tn
-
                 acc  = norm * fm[:,np.newaxis] + tang * (fm * BH_SWIRL)[:,np.newaxis]
                 av   = av * BH_DAMPING + acc * dt
-
-                # Speed cap — prevents teleportation on next frame
                 spd  = np.linalg.norm(av, axis=1, keepdims=True)
                 av   = np.where(spd > BH_SPEED_CAP, av / spd * BH_SPEED_CAP, av)
-
                 ap  += av * dt * TARGET_FPS
-
                 pos[active] = ap
                 vel[active] = av
 
-            # Drain: consume particles within BH_CORE_RADIUS
+            # Drain particles that reach the core
             if np.any(active):
                 aidx  = np.where(active)[0]
                 dists = np.linalg.norm(pos[aidx] - bh_center, axis=1)
@@ -889,7 +835,7 @@ def main():
                     vel[consumed]    = 0
 
         else:
-            # ── All other modes: normal N-body ──────────────────────────
+            # ── Normal / Supernova physics ──────────────────────────────
             if len(phys_targets) > 0 and np.any(active):
                 ap = pos[active]
                 av = vel[active]
@@ -923,34 +869,23 @@ def main():
 
         colors = colors * 0.88 + np.array(tgt_col, dtype=float) * 0.12
 
-        # ══════════════════════════════════════════════
-        #  RENDER
-        # ══════════════════════════════════════════════
-
-        # Layer 0: background photo
+        # ── Render ─────────────────────────────────────────────────────
         screen.blit(bg, (0, 0))
 
-        # Layer 1: darkening vignette
         dark = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         dark.fill((0, 0, 12, 105))
         screen.blit(dark, (0, 0))
 
-        # Layer 2: motion trail
         trail_surf.fill((0, 0, 0, 18))
         screen.blit(trail_surf, (0, 0))
 
-        # Layer 3: galaxy spiral
-        galaxy_ov.draw(screen)
-
-        # Layer 4: scan line
         if scanning:
             sc = lerp_col((0,180,255),(0,255,100), abs(math.sin(now*5)))
-            pygame.draw.line(screen, sc, (0,int(scan_y)),(WIDTH,int(scan_y)), 2)
-            gs = pygame.Surface((WIDTH,16),pygame.SRCALPHA)
+            pygame.draw.line(screen, sc, (0,int(scan_y)), (WIDTH,int(scan_y)), 2)
+            gs = pygame.Surface((WIDTH,16), pygame.SRCALPHA)
             gs.fill((*sc,30))
-            screen.blit(gs,(0,int(scan_y)-8))
+            screen.blit(gs, (0,int(scan_y)-8))
 
-        # Layer 5: particles
         active_idx = np.where(active)[0]
         for i in active_idx:
             x, y = int(pos[i,0]), int(pos[i,1])
@@ -966,36 +901,28 @@ def main():
                 pygame.gfxdraw.filled_circle(screen, x, y, size, c)
             except (ValueError, OverflowError):
                 pass
-            # Velocity streaks during supernova
             if spd > 14 and mode == MODE_SUPERNOVA:
                 vn = vel[i]/(spd+1e-6)*min(spd*1.1, 18)
-                pygame.draw.line(screen,(*c,90),(x,y),(int(x-vn[0]),int(y-vn[1])),1)
+                pygame.draw.line(screen, (*c,90), (x,y),
+                                 (int(x-vn[0]),int(y-vn[1])), 1)
 
-        # Layer 6: accretion disk
         accretion.draw(screen)
-
-        # Layer 7: shockwaves
         shockwaves.draw(screen)
 
-        # Layer 8: white flash (supernova)
         if flash_white > 0:
             fs = pygame.Surface((WIDTH, HEIGHT))
             fs.fill((255,255,255))
             fs.set_alpha(int(255*flash_white))
-            screen.blit(fs,(0,0))
+            screen.blit(fs, (0,0))
             flash_white = max(0.0, flash_white - dt*5.5)
 
-        # Layer 9: debug skeleton
         if debug_mode and len(targets) > 0:
-            for tx,ty in targets:
-                pygame.draw.circle(screen,(255,0,0),(int(tx),int(ty)),4)
+            for tx, ty in targets:
+                pygame.draw.circle(screen, (255,0,0), (int(tx),int(ty)), 4)
 
-        # Layer 10: HUD
         hud.draw(screen)
-
         pygame.display.flip()
 
-    # Cleanup
     cap.release()
     try: pose.close()
     except Exception: pass
