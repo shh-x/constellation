@@ -1,0 +1,10 @@
+libsdl2-dev
+libsdl2-image-dev
+libsdl2-mixer-dev
+libsdl2-ttf-dev
+libgl1
+libglib2.0-0
+libsm6
+libxext6
+libxrender-dev
+ffmpeg
